@@ -1,46 +1,55 @@
 # app/agent_workflow.py
+from typing import List, TypedDict, Literal, Annotated
+import operator
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from typing import List, TypedDict, Literal
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from pydantic import BaseModel, Field
 from langchain.agents import AgentExecutor, create_react_agent
 from langgraph.graph import StateGraph, END
-from .tools import send_notification, get_alternative_route 
 
+from .config import llm
+from .tools import send_notification, get_alternative_route
 
-from .config import llm  # Import the initialized Gemini model
-from .tools import send_notification
-
-# -- 1. Define the Plan and State --
+# -- 1. DEFINE THE PLAN AND STATE --
+# This plan includes the workflow_type for the planner's decision.
 class Plan(BaseModel):
     """The concrete plan of action to resolve a disruption."""
-    steps: List[str] = Field(..., 
+    workflow_type: Literal["sequential", "parallel"] = Field(
+        ..., description="The type of workflow to execute. Use 'parallel' for independent tasks."
+    )
+    steps: List[str] = Field(...,
         description="A list of tasks for the specialized agents. Each task must start with the agent's name, e.g., 'CommsAgent: ...' or 'TrafficAgent: ...'."
     )
 
+# The state is updated to collect results from parallel runs.
 class AgentState(TypedDict):
     disruption_scenario: str
     plan: Plan
+    # This annotation is the fix
+    task_results: Annotated[list, operator.add]
     current_task_index: int
-    task_result: str
+    final_resolution: str
 
-# -- 2. Create the Planning Agent (The Brain) --
-# Corrected planner_prompt
+# -- 2. CREATE THE AGENTS (PLANNER & SPECIALISTS) --
 planner_prompt = ChatPromptTemplate.from_template(
-    """You are the CORE BRAIN, an expert logistics planner. Your job is to create a simple, step-by-step plan to resolve the following disruption.
+    """You are the CORE BRAIN, an expert logistics planner. Your job is to create a plan to resolve the following disruption.
 
-    Assign each step to a specialist:
+    First, decide if the tasks can be run in parallel or must be run sequentially.
+    - Use 'parallel' if the tasks are independent (e.g., finding a new route AND notifying a customer).
+    - Use 'sequential' if one task depends on the result of another.
+
+    Next, list the steps for your plan, assigning each to a specialist:
     - [CommsAgent] for communication tasks.
     - [TrafficAgent] for route or traffic-related tasks.
-    
+
     Disruption Scenario: {disruption_scenario}
     """
 )
 planner_agent = planner_prompt | llm.with_structured_output(Plan)
 
-# -- 3. Create the Specialized Agent (The Hands) --
+# CommsAgent and its prompt
 comms_tools = [send_notification]
-# Corrected comms_prompt
-# This new prompt has all the required variables for a ReAct agent.
 comms_prompt = PromptTemplate.from_template(
     """
 You are the CommsAgent, a communications specialist. Answer the following questions as best you can. You have access to the following tools:
@@ -66,6 +75,8 @@ Thought:{agent_scratchpad}
 )
 comms_agent_runnable = create_react_agent(llm, comms_tools, comms_prompt)
 comms_agent_executor = AgentExecutor(agent=comms_agent_runnable, tools=comms_tools, verbose=True, handle_parsing_errors=True)
+
+# TrafficAgent and its prompt
 traffic_tools = [get_alternative_route]
 traffic_prompt = PromptTemplate.from_template(
     """
@@ -93,37 +104,71 @@ Thought:{agent_scratchpad}
 traffic_agent_runnable = create_react_agent(llm, traffic_tools, traffic_prompt)
 traffic_agent_executor = AgentExecutor(agent=traffic_agent_runnable, tools=traffic_tools, verbose=True, handle_parsing_errors=True)
 
-# -- 4. Define the Graph Nodes --
+
+
+# -- 3. DEFINE THE GRAPH NODES --
 def planner_node(state: AgentState):
     print("--- 🧠 Planner Agent Running ---")
     plan = planner_agent.invoke({"disruption_scenario": state["disruption_scenario"]})
-    return {"plan": plan, "current_task_index": 0}
+    return {"plan": plan, "task_results": []} # Initialize results list
 
-def specialist_node(state: AgentState):
-    print(f"--- 🛠️ Specialist Agent Running Task #{state['current_task_index']} ---")
-    current_task = state["plan"].steps[state["current_task_index"]]
-    
-    # This routing logic now sends the task to the correct agent
-    if "CommsAgent" in current_task:
-        result = comms_agent_executor.invoke({"input": current_task})
-    elif "TrafficAgent" in current_task:
-        result = traffic_agent_executor.invoke({"input": current_task})
-    else:
-        result = {"output": f"Error: No agent found for task '{current_task}'."}
-        
-    return {"task_result": result["output"], "current_task_index": state["current_task_index"] + 1}
+# Specialist nodes now pull their own tasks from the plan
+def comms_agent_node(state: AgentState):
+    print("--- 🛠️ CommsAgent Running ---")
+    task = next(s for s in state["plan"].steps if "CommsAgent" in s)
+    result = comms_agent_executor.invoke({"input": task})
+    return {"task_results": state['task_results'] + [("CommsAgent", result["output"])]}
+
+def traffic_agent_node(state: AgentState):
+    print("--- 🛠️ TrafficAgent Running ---")
+    task = next(s for s in state["plan"].steps if "TrafficAgent" in s)
+    result = traffic_agent_executor.invoke({"input": task})
+    return {"task_results": state['task_results'] + [("TrafficAgent", result["output"])]}
+
+# New node to aggregate results from parallel runs
+def aggregator_node(state: AgentState):
+    print("---  собиратель (Aggregator) Running ---")
+    final_resolution = "\n".join([f"{agent}: {result}" for agent, result in state["task_results"]])
+    return {"final_resolution": final_resolution}
+
+# -- 4. DEFINE THE ROUTER --
 def router(state: AgentState):
-    if state["current_task_index"] >= len(state["plan"].steps):
+    print("--- ROUTING ---")
+    if state["plan"].workflow_type == "parallel":
+        # Fan out to all specialists, then join at the aggregator
+        return ["comms_agent", "traffic_agent"]
+    else:
+        # For now, sequential flow is not fully implemented, so we end.
+        # This can be built out later.
+        print("Sequential workflow not fully implemented. Ending.")
         return END
-    return "specialist"
 
-# -- 5. Assemble the Workflow Graph --
+# -- 5. ASSEMBLE THE WORKFLOW GRAPH --
 workflow = StateGraph(AgentState)
+
 workflow.add_node("planner", planner_node)
-workflow.add_node("specialist", specialist_node)
+workflow.add_node("comms_agent", comms_agent_node)
+workflow.add_node("traffic_agent", traffic_agent_node)
+workflow.add_node("aggregator", aggregator_node)
 
 workflow.set_entry_point("planner")
-workflow.add_edge("planner", "specialist")
-workflow.add_conditional_edges("specialist", router, {END: END, "specialist": "specialist"})
+
+# After the planner, the router decides where to go
+workflow.add_conditional_edges(
+    "planner",
+    router,
+    {
+        # For parallel, LangGraph will automatically route to the list of nodes
+        # and then wait for them all to finish.
+        "comms_agent": "comms_agent",
+        "traffic_agent": "traffic_agent",
+        END: END
+    }
+)
+
+# After the parallel tasks are done, they all go to the aggregator
+workflow.add_edge("comms_agent", "aggregator")
+workflow.add_edge("traffic_agent", "aggregator")
+workflow.add_edge("aggregator", END)
 
 compiled_workflow = workflow.compile()
