@@ -3,6 +3,7 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 from .agent_workflow import compiled_workflow
+from .memory_handler import update_rag_memory
 
 class DisruptionRequest(BaseModel):
     scenario: str
@@ -15,16 +16,19 @@ async def resolve_disruption(request: DisruptionRequest):
     inputs = {"disruption_scenario": request.scenario, "current_task_index": 0}
     final_state = {}
     
-    # We must iterate through all events to get the final state
     async for event in compiled_workflow.astream(inputs):
         for key, value in event.items():
             print(f"--- Node '{key}' finished ---")
-            # This continuously updates with the latest state
-            final_state = value 
+            final_state = value
             
-    # After the loop, final_state holds the true final state
-    resolution = final_state.get("final_resolution", "Processing failed or no resolution found.")
+    resolution = final_state.get("final_resolution", "Processing failed.")
     
+    # If the workflow was successful, save the plan to memory
+    if "failed" not in resolution.lower():
+        successful_plan = final_state.get("plan")
+        if successful_plan:
+            # Convert the Pydantic model to a string for saving
+            plan_str = f"Workflow: {successful_plan.workflow_type}, Steps: {successful_plan.steps}"
+            update_rag_memory(plan_str, request.scenario)
+            
     return {"resolution": resolution}
-
-# To run the app: uvicorn app.main:app --reload

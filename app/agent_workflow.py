@@ -10,6 +10,7 @@ from langgraph.graph import StateGraph, END
 
 from .config import llm
 from .tools import send_notification, get_alternative_route
+from .memory_handler import retrieve_rag_memories, update_rag_memory
 
 # -- 1. DEFINE THE PLAN AND STATE --
 # This plan includes the workflow_type for the planner's decision.
@@ -109,9 +110,18 @@ traffic_agent_executor = AgentExecutor(agent=traffic_agent_runnable, tools=traff
 # -- 3. DEFINE THE GRAPH NODES --
 def planner_node(state: AgentState):
     print("--- 🧠 Planner Agent Running ---")
-    plan = planner_agent.invoke({"disruption_scenario": state["disruption_scenario"]})
-    return {"plan": plan, "task_results": []} # Initialize results list
-
+    
+    # First, retrieve relevant memories
+    memories = retrieve_rag_memories(state["disruption_scenario"])
+    
+    # Inject memories into the prompt for the planner
+    prompt_with_memories = planner_prompt.invoke({
+        "disruption_scenario": state["disruption_scenario"],
+        "rag_results": memories  # Assumes your prompt has a {rag_results} placeholder
+    })
+    
+    plan = planner_agent.invoke(prompt_with_memories)
+    return {"plan": plan, "task_results": []}
 # Specialist nodes now pull their own tasks from the plan
 def comms_agent_node(state: AgentState):
     print("--- 🛠️ CommsAgent Running ---")
@@ -134,14 +144,34 @@ def aggregator_node(state: AgentState):
 # -- 4. DEFINE THE ROUTER --
 def router(state: AgentState):
     print("--- ROUTING ---")
-    if state["plan"].workflow_type == "parallel":
-        # Fan out to all specialists, then join at the aggregator
-        return ["comms_agent", "traffic_agent"]
-    else:
-        # For now, sequential flow is not fully implemented, so we end.
-        # This can be built out later.
-        print("Sequential workflow not fully implemented. Ending.")
+    plan = state.get("plan")
+    
+    if not plan or not plan.steps:
+        print("--- ROUTING: No plan or steps found. Ending. ---")
         return END
+
+    if plan.workflow_type == "parallel":
+        # For parallel, dynamically find which agents are needed from the plan
+        tasks_to_run = []
+        if any("CommsAgent" in step for step in plan.steps):
+            tasks_to_run.append("comms_agent")
+        if any("TrafficAgent" in step for step in plan.steps):
+            tasks_to_run.append("traffic_agent")
+        
+        # This will now only return the agents that actually have a job to do
+        return tasks_to_run
+    else:
+        # For sequential, check if we are done
+        task_index = state.get("current_task_index", 0)
+        if task_index >= len(plan.steps):
+            return END
+        
+        # Route to the correct sequential agent
+        next_task = plan.steps[task_index]
+        if "CommsAgent" in next_task:
+            return "comms_agent"
+        else:
+            return "traffic_agent"
 
 # -- 5. ASSEMBLE THE WORKFLOW GRAPH --
 workflow = StateGraph(AgentState)
