@@ -1,34 +1,46 @@
-# app/main.py
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
+from typing import Optional
 from .agent_workflow import compiled_workflow
-from .memory_handler import update_rag_memory
+
+# Pydantic models now match the rich data structure from the mock server.
+class Customer(BaseModel):
+    id: str
+    name: str
+
+class Merchant(BaseModel):
+    id: str
+    name: str
+    status: Optional[str] = None
+
+class DeliveryDetails(BaseModel):
+    destination_address: str
 
 class DisruptionRequest(BaseModel):
-    scenario: str
+    order_id: str
+    scenario_text: str
+    customer: Customer
+    merchant: Merchant
+    driver: dict
+    delivery_details: DeliveryDetails
 
 app = FastAPI(title="Synapse Agent Core (Gemini)")
 
 @app.post("/resolve")
 async def resolve_disruption(request: DisruptionRequest):
-    """Receives a disruption scenario and returns the final resolution."""
-    inputs = {"disruption_scenario": request.scenario, "current_task_index": 0}
-    final_state = {}
+    """Receives a rich disruption scenario and initiates the agent workflow."""
     
+    # CRITICAL FIX: Pass the entire dictionary of request data into the workflow.
+    inputs = {"request_data": request.dict()}
+    
+    final_state = {}
     async for event in compiled_workflow.astream(inputs):
         for key, value in event.items():
             print(f"--- Node '{key}' finished ---")
             final_state = value
             
-    resolution = final_state.get("final_resolution", "Processing failed.")
+    resolution = final_state.get("final_resolution", "Processing failed or no resolution found.")
     
-    # If the workflow was successful, save the plan to memory
-    if "failed" not in resolution.lower():
-        successful_plan = final_state.get("plan")
-        if successful_plan:
-            # Convert the Pydantic model to a string for saving
-            plan_str = f"Workflow: {successful_plan.workflow_type}, Steps: {successful_plan.steps}"
-            update_rag_memory(plan_str, request.scenario)
-            
-    return {"resolution": resolution}
+    return {"resolution": resolution, "order_id": request.order_id}
+
